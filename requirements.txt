@@ -1,0 +1,4 @@
+bm25s
+sqlglot
+sentence-transformers
+numpy<2

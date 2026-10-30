@@ -1,0 +1,224 @@
+\documentclass[sigconf,nonacm]{acmart}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\emergencystretch=1em
+\settopmatter{printacmref=false, printccs=false, printfolios=true}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+\begin{document}
+\title{Agent-based Text-to-SQL with Schema-Aware Retrieval State}
+\subtitle{COMPSCI 646 Project Milestone 1}
+
+\author{Shalin}
+\affiliation{\institution{SPIRE ID: 35712086}\country{}}
+\author{Sachin Mallick}
+\affiliation{\institution{SPIRE ID: 35718202}\country{}}
+\author{Mauli Mehulkumar Patel}
+\affiliation{\institution{SPIRE ID: 35231636}\country{}}
+\author{Manuj Jain}
+\affiliation{\institution{SPIRE ID: 35710448}\country{}}
+\renewcommand{\shortauthors}{Shalin, Mallick, Patel, Jain}
+
+\begin{abstract}
+Text-to-SQL generation over large schemas requires a retriever that selects a small subset of tables for the SQL generator. If the retriever misses a table that is needed for a correct SQL answer, the generation will fail. We propose a state-aware table retriever that augments the question with out-of-question signals: domain evidence and agent-loop execution error signals. These signals are separately embedded and fused to obtain table scores. We also explore adding a foreign-key (FK) graph bonus, or expanding by join paths. This milestone reports baseline results on the pooled BIRD dev (1,534 questions, 75 tables). Dense retrieval (BGE-base) achieves 85.5\% coverage@5, a large improvement over BM25 at 59.5\%. Adding an off-the-shelf cross-encoder reranker brings the score down to 80.9\%, and it stays below dense even when the table documents include column descriptions (83.8\% vs.\ 88.6\%). We then show that simply appending the BIRD evidence to the question lifts dense coverage@5 to 91.5\% and coverage@10 from 95.3\% to 97.7\%, suggesting that out-of-question signals help retrieval as well as generation, although BIRD evidence often names the needed columns directly.
+
+\end{abstract}
+
+\maketitle
+
+\section{Introduction}
+
+Table selection is important in text-to-SQL pipelines, because many databases have dozens of tables. The retriever is used to filter down to the small subset of candidate tables that fit into the LLM's context window. The current table retrieval approach is one-shot table retrieval using only the question.
+
+However, many questions do not contain the vocabulary that is required to retrieve all of the tables that are required for a correct SQL answer. BIRD~\cite{bird} supplies domain evidence per question, but prior work has only supplied this as a signal to the SQL generator. In addition, when the generator outputs failing SQL (``no such column'', or empty result), the agent can use this as a signal for what may be missing.
+
+We propose an agent loop of retrieval, SQL generation, execution and retry, where the retriever is improved to score tables from the question, evidence, and error signal rewrite. We will compare this against question-only baselines, and against appending previously retrieved tables to the query (which MURRE~\cite{murre} showed to be detrimental).
+
+Contributions:
+\begin{itemize}
+\item Proposed state-aware retriever that separately embeds and fuses the question, evidence and error signal.
+\item Investigate the effect of evidence (RQ1) and execution errors (RQ2) on table retrieval coverage and end-to-end accuracy.
+\item Investigate whether the FK graph score and join-path expansion still contribute when the first retrieval stage is state-aware (RQ3).
+\item Reproducible pooled BIRD dev (75 tables); we will share code.
+\end{itemize}
+
+\section{Related Work}
+
+\textbf{Schema linking and subsetting.} RESDSQL~\cite{resdsql} uses a cross-encoder to rank schema items, but assumes the schema fits. CRUSH4SQL~\cite{crush} has an LLM hallucinate the minimal schema, and retrieve real elements for each piece. CHESS~\cite{chess} uses a chain of LLM calls to prune the schema. These retrieve only once, from the question.
+
+\textbf{Join-aware retrieval.} JAR~\cite{jar} reranks dense results with a mixed-integer program that scores question-table relevance and table-table joinability. REaR~\cite{rear} uses retrieve, expand and refine stages, without an LLM. Our FK score and join-path expansion are similar, but applied on top of a state-aware first retrieval stage.
+
+\textbf{Execution feedback.} Self-Debugging~\cite{selfdebug}, the Refiner agent of MAC-SQL~\cite{macsql} and the revision step of CHESS~\cite{chess} feed execution errors back to the LLM to repair the SQL. In all of them the schema subset stays fixed, so a missing table cannot be recovered. We send the error to the retriever instead.
+
+\textbf{Iterative retrieval.} IRCoT~\cite{ircot} interleaves retrieval with chain-of-thought for open-domain QA. MURRE~\cite{murre} does multi-hop table retrieval, and finds that appending retrieved tables to the query brings in look-alike tables. These methods only provide signals from the question; to our knowledge, evidence and execution errors have not been used as signals for table retrieval itself.
+
+\section{Problem Statement}
+
+Given a database with tables $T=\{t_1,\dots,t_N\}$ and FK graph $G=(T,E)$, table $t\in T$ is represented by document $d(t)$ consisting of its name, columns, FK neighbours (and optionally column descriptions and sample values). For question $q$, gold tables $R^*(q)$ are determined from the gold SQL. At agent step $i$, the state is
+\begin{equation}
+s_i = (q, P_i, e_i),
+\end{equation}
+where $P_i$ is the available evidence (e.g., domain rule) and $e_i$ is the failure signal from previous SQL attempt ($e_0=\emptyset$). Retriever $f$ maps $s_i$ to ranking over $T$. The top-$k$ tables $R_k(s_i)$ are passed to the SQL generator $g$ to output $y_i$. Stop when $y_i$ is valid, or iteration limit reached. Goal is to ensure $R^*(q)\subseteq R_k(s_i)$ for small $k$, and to get the correct execution result.
+
+\textbf{Example (BIRD).} ``How many directly charter-funded schools have an average SAT math score above 560?'' requires the tables \texttt{satscores} and \texttt{frpm}. The second has almost no vocabulary overlap with the question, which is what we target.
+
+\textbf{Research questions.}
+\begin{itemize}
+\item \textbf{RQ1.} Does retrieving with $(q, P_i)$ cover $R^*(q)$ more often than retrieving with $q$ alone, and does score fusion beat both concatenating $P_i$ into the query and appending previously retrieved tables (B4)?
+\item \textbf{RQ2.} After a failed SQL attempt, does re-retrieving with $(q, P_i, e_i)$ recover missing tables and improve execution accuracy (EX), compared with regenerating SQL from the same tables at an equal number of generator calls?
+\item \textbf{RQ3.} Once retrieval is state-aware, do the FK score and join-path expansion still improve coverage or EX, and for which questions (e.g., those whose gold set contains a pure join table)?
+\end{itemize}
+
+\textbf{Changes since the proposal.} (1) Our first runs showed that retrieval within a single database is saturated (Spider dev, BM25 coverage@10 = 99.9\%), so the main setting is now the pooled schema, where all dev databases share one index. (2) The proposal named B3 (dense + rerank) as the strongest baseline; in our runs B3 is below B2 (Section~\ref{sec:results}), so B2 and dense + evidence are now the controls. (3) Rerank depth is 20 instead of 50, since dense already places 99.2\% of gold tables in its top 20. RQs and benchmarks are otherwise unchanged.
+
+\begin{table*}[t]
+\caption{Table retrieval on pooled BIRD dev (75 tables, 1,534 questions). ``+ descriptions'' adds BIRD column descriptions and three sample values per column to the table documents; ``+ evidence'' appends BIRD's per-question evidence to the query. R = recall, C = full coverage. All numbers are our own runs (\%).}
+\label{tab:main}
+\begin{tabular}{lrrrrrr}
+\toprule
+Method & R@5 & R@10 & C@5 & C@10 & C@20 & MRR\\
+\midrule
+B1 BM25 & 73.0 & 81.3 & 59.5 & 72.0 & 77.2 & 70.6\\
+B2 Dense & 92.8 & 97.6 & 85.5 & 95.3 & 98.4 & 88.6\\
+B3 Dense + Rerank & 89.3 & 95.8 & 80.9 & 92.2 & 98.4 & 85.2\\
+\midrule
+B2 Dense + descriptions & 94.7 & 98.1 & 88.6 & 95.8 & 98.9 & 91.8\\
+B3 Dense + Rerank + descriptions & 91.8 & 97.2 & 83.8 & 94.3 & 98.9 & 89.4\\
+\midrule
+B2 Dense + evidence & \textbf{96.1} & \textbf{99.0} & \textbf{91.5} & \textbf{97.7} & \textbf{99.2} & \textbf{91.6}\\
+B3 Dense + Rerank + evidence & 92.8 & 97.9 & 86.0 & 95.6 & \textbf{99.2} & 87.4\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{table*}[t]
+\caption{Coverage@10 on pooled BIRD dev by number of gold tables, with 95\% bootstrap intervals for overall coverage@10 (\%).}
+\label{tab:breakdown}
+\begin{tabular}{lrrrc}
+\toprule
+Method & 1 table ($n$=363) & 2 tables ($n$=935) & 3+ tables ($n$=236) & Overall C@10 [95\% CI]\\
+\midrule
+B1 BM25 & 87.9 & 72.4 & 45.8 & 72.0 [69.6, 74.2]\\
+B2 Dense & 98.3 & 95.6 & 89.4 & 95.3 [94.3, 96.4]\\
+B3 Dense + Rerank & 98.6 & 92.5 & 81.4 & 92.2 [90.8, 93.7]\\
+B2 Dense + descriptions & 99.7 & 96.1 & 88.6 & 95.8 [94.8, 96.9]\\
+B3 Dense + Rerank + descriptions & 99.7 & 94.7 & 84.7 & 94.3 [93.2, 95.4]\\
+B2 Dense + evidence & 99.7 & 98.4 & 91.5 & 97.7 [96.9, 98.4]\\
+B3 Dense + Rerank + evidence & 99.2 & 96.5 & 86.9 & 95.6 [94.6, 96.6]\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Proposed Method}
+
+\textbf{State-aware scoring.} Instead of concatenating the question $q$, evidence $P_i$, and error signal $e_i$ (which would be dominated by the longest one), we separately embed each of the parts using the same bi-encoder $E$ and fuse the cosine similarities:
+\begin{equation}
+\begin{split}
+s(t\mid s_i)={}&\cos(E(q),E(d_t))+\beta\cos(E(P_i),E(d_t))\\
+&+\gamma\cos(E(\hat e_i),E(d_t)).
+\end{split}
+\end{equation}
+$\hat e_i$ is the error rewrite into a retrieval query: for ``no such column: X'', include X and the clause where it occurs; for empty result, include the SQL's unresolved predicates. We then rerank the top-$m$ tables ($m=20$, as in B3) with a cross-encoder. Given the B3 result in Section~\ref{sec:results}, the reranker is kept only if it improves coverage on a held-out slice of BIRD train.
+
+\textbf{FK score and join-path expansion (RQ3).} Add bonus to encourage adding joinable tables to strong candidates:
+\begin{equation}
+s'(t)=s(t)+\lambda\max_{u\in R_m,\,(t,u)\in E} s(u).
+\end{equation}
+If the top-2 tables are not connected, add the shortest FK path between them. This uses declared FKs only.
+
+\textbf{Agent loop.} Use at most three generator calls ($I_{\max}=2$). Generator Qwen2.5-7B-Instruct~\cite{qwen} fixed. Tune $\beta$, $\gamma$ and $\lambda$ on BIRD train, never dev. Algorithm~\ref{alg:loop} gives the inference steps; no component is trained in the base version.
+
+\begin{algorithm}[t]
+\caption{State-aware retrieval inside the agent loop}\label{alg:loop}
+\begin{algorithmic}[1]
+\State $P_0 \gets$ evidence for $q$ \Comment{BIRD evidence, or retrieved}
+\State $e_0 \gets \emptyset$
+\For{$i = 0, \dots, I_{\max}$}
+  \State $R_m \gets$ top-$m$ tables by Eq.~2
+  \State $R_k \gets$ top-$k$ of FK-scored $R_m$ $\cup$ join-path tables
+  \State $y_i \gets g(q, P_i, R_k)$; \ $r \gets \mathrm{Exec}(y_i)$
+  \If{$r$ is valid and non-empty} \Return $y_i$ \EndIf
+  \State $e_{i+1} \gets \mathrm{Rewrite}(\mathrm{Error}(r))$ \Comment{RQ2: re-retrieve}
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Original contribution.} Our hypothesis is that information the question lacks ($P_i$, $e_i$) should be given to the retriever, not only the generator. This differs from B4/MURRE, which feed back tables the question already implies, and from CRUSH4SQL, CHESS, JAR and REaR, which retrieve once from the question. External components are bm25s~\cite{bm25s}, BGE models~\cite{bge} via sentence-transformers~\cite{sbert}, Qwen2.5-7B-Instruct~\cite{qwen} and sqlglot~\cite{sqlglot}. The score fusion, error rewriting, FK scoring, table-document builder, evaluation harness and agent loop are our own code.
+
+\textbf{Risks and fallbacks.} (1) BIRD evidence is hand-written and may overstate RQ1; we will also test evidence retrieved from BIRD train (top-1 by question similarity). (2) A 7B generator may produce few informative errors; if so, we add an LLM self-check (``which table is missing?'') as a second feedback signal and report both. (3) The zero-shot bi-encoder may be weak on identifiers; if so, we fine-tune it on BIRD train (question, gold table) pairs with BM25-mined hard negatives.
+
+\section{Baselines and Current Results}\label{sec:results}
+
+\textbf{Benchmarks.} BIRD~\cite{bird}: 12,751 questions over 95 databases (\url{https://bird-bench.github.io}). Train (9,428 questions, 69 databases) is used only to tune $\beta$, $\gamma$, $\lambda$ and for optional fine-tuning; the test set is hidden, so dev is our evaluation set. SpiderUnion~\cite{crush}, the union of all Spider schemas, is the larger pooled setting for later experiments, and Spider dev~\cite{spider} (1,034 questions, 81 tables) is used for harness validation and as a no-evidence control. Preprocessing is done: gold tables, table documents and pooled indexes.
+
+\textbf{Setup.} BIRD dev~\cite{bird}: 1,534 questions over 11 databases, pooled into one index of 75 tables, following the open-domain BirdUnion setting of CRUSH4SQL~\cite{crush}. Gold tables are extracted from the gold SQL using sqlglot~\cite{sqlglot}; this matches exactly the hand-annotated tables on Spider dev~\cite{spider} for all 1,034 questions. Metrics: recall@$k$ and full coverage@$k$ (percentage of questions whose top-$k$ contains all the gold tables) for $k\in\{5,10,20\}$.
+
+\textbf{Baselines.} All methods use the same table documents.
+\begin{itemize}
+\item \textbf{B1}: BM25~\cite{bm25s} (question only).
+\item \textbf{B2}: Dense bi-encoder, BGE-base~\cite{bge} (question only).
+\item \textbf{B3}: B2 + BGE-reranker-base on dense top 20.
+\item \textbf{B4} (planned): B3 + appending the top-3 retrieved tables to the query~\cite{murre}.
+\item \textbf{B5} (planned): CRUSH4SQL~\cite{crush} reimplementation. \textbf{B6} (planned): REaR~\cite{rear} or JAR~\cite{jar}.
+\end{itemize}
+B1--B3 are the standard first stages of schema retrieval and isolate what question-only retrieval achieves; B4 is the direct control for RQ1; B5/B6 are the published single-shot and join-aware methods closest to our approach.
+
+\textbf{Implemented and tested.} A loader for BIRD and Spider files; gold-table extraction with sqlglot (validated above); a table-document builder (name, columns, FK neighbours, and optionally BIRD column descriptions and sample values); B1--B3 behind one script in pooled and per-database settings, with an evidence option; and an evaluation harness for recall@$k$, coverage@$k$, MRR, 95\% bootstrap intervals and gold-table breakdowns. \textbf{Remaining:} B4, B5/B6 reimplementations, and the end-to-end EX harness. There are no blockers beyond compute scheduling.
+
+
+\textbf{Findings.} Dense retrieval beats BM25 by 26 points in coverage@5 (Table~\ref{tab:main}) because BIRD names are abbreviations (\texttt{frpm}, \texttt{AvgScrMath}) that keyword matching misses. Dense already reaches 95.3\% coverage@10 and 98.4\% coverage@20, so room to improve is at small $k$. Reranking the dense top 20 with an off-the-shelf cross-encoder lowers coverage@5 from 85.5\% to 80.9\%. Our first table documents contained only identifiers (table and column names and FK links), so we reran B2 and B3 with BIRD column descriptions and sample values. Descriptions raise coverage@5 for both (85.5\% to 88.6\% for dense, 80.9\% to 83.8\% for the reranker), but the reranker stays about five points below dense. The gap is therefore not explained by document content: the off-the-shelf reranker does not transfer well to schema documents. For now, B2 is the strongest question-only baseline and the one our method must beat.
+
+\textbf{Pooling matters.} On Spider dev with BM25, coverage@10 is 99.9\% when each question searches only its own database, but drops to 85.1\% when all 81 tables are pooled, further dropping to 75.8\% for questions with three or more gold tables. Per-database retrieval is therefore too easy. The pooled setting also matches the open-domain case where the system does not know which database holds the answer, as in large data warehouses, so it is our main setting.
+
+\textbf{Multi-table questions.} Coverage falls as the number of gold tables grows (Table~\ref{tab:breakdown}). For questions with three or more gold tables, BM25 finds all of them only 45.8\% of the time, and even dense retrieval drops to 89.4\%, compared with 98.3\% for single-table questions. The reranker's loss is concentrated here (81.4\% on 3+ tables), which suggests it promotes one strongly matching table at the expense of the others a join needs. Descriptions help on one- and two-table questions but not on 3+ tables (88.6\% vs.\ 89.4\%). These questions are where our FK score and join-path expansion (RQ3) should help most.
+
+\textbf{Early RQ1 signal.} Appending BIRD's evidence to the question lifts dense coverage@5 from 85.5\% to 91.5\% and coverage@10 from 95.3\% to 97.7\%; the reranker gains by a similar margin (80.9\% to 86.0\% at $k=5$) but stays below dense. This uses plain concatenation, not our proposed score fusion, so it is the control our fused retriever has to beat. The 95\% bootstrap intervals for coverage@10 do not overlap (95.3 [94.3, 96.4] vs.\ 97.7 [96.9, 98.4]), a conservative check (paired tests will follow), and the gain holds for every gold-table bucket, including 3+ tables (89.4\% to 91.5\%). The same non-overlap holds for the reranker's loss against dense (92.2 [90.8, 93.7]). One caveat remains: BIRD evidence is hand-written and often names columns directly, so it may overstate the benefit; we will also test evidence retrieved from BIRD train.
+\textbf{Reproducibility.} BM25: bm25s~\cite{bm25s}, Lucene variant, $k_1=0.9$, $b=0.4$, with identifier splitting. Dense: BAAI/bge-base-en-v1.5~\cite{bge} via sentence-transformers~\cite{sbert}, with the BGE query prefix and normalized embeddings. Reranker: BAAI/bge-reranker-base, depth 20, max length 512. Batch sizes: 16 for table encoding and reranking, 32 for queries. No training is involved. Data: BIRD dev release \texttt{dev\_20240627}. All retrieval is deterministic. On a Colab T4, BM25 over BIRD dev takes 12\,s, dense retrieval about 20--50\,s, and reranking the top 20 about 9--13\,min.
+
+\section{Experimental Plan}
+\begin{itemize}
+\item \textbf{E1} (done): B1--B3 on pooled BIRD dev (Tables~\ref{tab:main} and~\ref{tab:breakdown}).
+\item \textbf{E2} (RQ1): concatenated evidence is done (Table~\ref{tab:main}); remaining are our fusion (Eq.~2) and B4, compared with dense + evidence as the stronger control.
+\item \textbf{E3} (RQ2): on questions whose first SQL fails, frozen tables vs.\ re-retrieval with the error, at an equal number of generator calls.
+\item \textbf{E4} (RQ3): best of E2/E3 with and without the FK score and join-path expansion, vs.\ B6.
+\item \textbf{E5}: full pipeline vs.\ B2, end-to-end execution accuracy (EX) on a fixed 500-question sample.
+\end{itemize}
+Significance: paired bootstrap for coverage and McNemar's test for EX, against the strongest baseline. Breakdowns by number of gold tables, presence of a pure join table, and BIRD difficulty.
+
+\textbf{Fairness and feasibility.} All methods share the table documents, $k$, the encoder size (no method gets a larger model) and the generator; tuning uses BIRD train only. Retrieval experiments run in minutes on a Colab T4. End-to-end runs need about 500 questions $\times$ up to 3 calls to a 7B model on one GPU, which fits on Colab or the department cluster within the course timeline.
+
+\section{Team Responsibilities}
+\begin{itemize}
+\item \textbf{Shalin}: agent loop, state-aware fusion, error rewrite; E2 and E3.
+\item \textbf{Sachin Mallick}: retrieval baselines B1--B4 and indexes; E1.
+\item \textbf{Mauli Mehulkumar Patel}: published baselines B5/B6, FK score and join-path expansion; E4.
+\item \textbf{Manuj Jain}: EX harness on SQLite, significance tests, error analysis; E5.
+\end{itemize}
+\textbf{Timeline.} By Nov 9: B4 and a 50-question end-to-end EX pilot. By Nov 16: fused evidence retriever (RQ1 complete) and the set of first-attempt failures. By Nov 23: error re-retrieval (RQ2) and B5/B6. By Nov 30: FK and join-path ablations (RQ3) and the full EX comparison; then writing.
+All four share one repository, one results schema and the evaluation code; each member drafts the report section for their experiments, and we merge results weekly into a single table.
+
+\section{Current Progress and Next Steps}
+
+\textbf{Done:} data pipeline, validated gold-table extraction, table documents, evaluation harness, B1--B3 on pooled BIRD dev with and without evidence and column descriptions (Tables~\ref{tab:main} and~\ref{tab:breakdown}). \textbf{Next, in the next two weeks:} the fused evidence retriever and B4 (completing RQ1) and the EX harness with the set of first-attempt failures for RQ2. Then B5/B6, the structural ablations and the end-to-end comparison.
+
+\begin{thebibliography}{16}
+\bibitem{bird} Jinyang Li et al. 2023. Can LLM Already Serve as A Database Interface? A BIg Bench for Large-Scale Database Grounded Text-to-SQLs. In \emph{NeurIPS}.
+\bibitem{crush} Mayank Kothyari, Dhruva Dhingra, Sunita Sarawagi, and Soumen Chakrabarti. 2023. CRUSH4SQL: Collective Retrieval Using Schema Hallucination For Text2SQL. In \emph{EMNLP}.
+\bibitem{chess} Shayan Talaei, Mohammadreza Pourreza, Yu-Chen Chang, Azalia Mirhoseini, and Amin Saberi. 2024. CHESS: Contextual Harnessing for Efficient SQL Synthesis. arXiv:2405.16755.
+\bibitem{jar} Peter Baile Chen, Yi Zhang, and Dan Roth. 2024. Is Table Retrieval a Solved Problem? Exploring Join-Aware Multi-Table Retrieval. In \emph{ACL}.
+\bibitem{rear} Rishita Agarwal, Himanshu Singhal, Peter Baile Chen, Manan Roy Choudhury, Dan Roth, and Vivek Gupta. 2026. REaR: Retrieve, Expand and Refine for Effective Multitable Retrieval. In \emph{ACL}.
+\bibitem{murre} Xuanliang Zhang, Dingzirui Wang, Longxu Dou, Qingfu Zhu, and Wanxiang Che. 2025. MURRE: Multi-Hop Table Retrieval with Removal for Open-Domain Text-to-SQL. In \emph{COLING}.
+\bibitem{ircot} Harsh Trivedi, Niranjan Balasubramanian, Tushar Khot, and Ashish Sabharwal. 2023. Interleaving Retrieval with Chain-of-Thought Reasoning for Knowledge-Intensive Multi-Step Questions. In \emph{ACL}.
+\bibitem{spider} Tao Yu et al. 2018. Spider: A Large-Scale Human-Labeled Dataset for Complex and Cross-Domain Semantic Parsing and Text-to-SQL Task. In \emph{EMNLP}.
+\bibitem{resdsql} Haoyang Li, Jing Zhang, Cuiping Li, and Hong Chen. 2023. RESDSQL: Decoupling Schema Linking and Skeleton Parsing for Text-to-SQL. In \emph{AAAI}.
+\bibitem{bge} Shitao Xiao, Zheng Liu, Peitian Zhang, and Niklas Muennighoff. 2023. C-Pack: Packaged Resources To Advance General Chinese Embedding. arXiv:2309.07597.
+\bibitem{bm25s} Xing Han L\`u. 2024. BM25S: Orders of magnitude faster lexical search via eager sparse scoring. arXiv:2407.03618.
+\bibitem{sbert} Nils Reimers and Iryna Gurevych. 2019. Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks. In \emph{EMNLP}.
+\bibitem{sqlglot} Toby Mao. SQLGlot: a no-dependency SQL parser, transpiler and optimizer. \url{https://github.com/tobymao/sqlglot}.
+\bibitem{qwen} Qwen Team. 2024. Qwen2.5 Technical Report. arXiv:2412.15115.
+\bibitem{selfdebug} Xinyun Chen, Maxwell Lin, Nathanael Sch\"arli, and Denny Zhou. 2024. Teaching Large Language Models to Self-Debug. In \emph{ICLR}.
+\bibitem{macsql} Bing Wang et al. 2025. MAC-SQL: A Multi-Agent Collaborative Framework for Text-to-SQL. In \emph{COLING}.
+\end{thebibliography}
+\end{document}

@@ -1,0 +1,45 @@
+{
+  "setting": "pooled",
+  "evidence": false,
+  "n_questions": 1534,
+  "n_tables": 75,
+  "n_databases": 11,
+  "results": {
+    "B2 Dense (bge-base-en-v1.5)": {
+      "recall@5": 94.7,
+      "coverage@5": 88.6,
+      "recall@10": 98.1,
+      "coverage@10": 95.8,
+      "recall@20": 99.4,
+      "coverage@20": 98.9,
+      "MRR": 91.8,
+      "coverage@10_95CI": [
+        94.8,
+        96.9
+      ],
+      "coverage@10 [1 table, n=363]": 99.7,
+      "coverage@10 [2 tables, n=935]": 96.1,
+      "coverage@10 [3+ tables, n=236]": 88.6
+    },
+    "B3 Dense+Rerank (bge-reranker-base)": {
+      "recall@5": 91.8,
+      "coverage@5": 83.8,
+      "recall@10": 97.2,
+      "coverage@10": 94.3,
+      "recall@20": 99.4,
+      "coverage@20": 98.9,
+      "MRR": 89.4,
+      "coverage@10_95CI": [
+        93.2,
+        95.4
+      ],
+      "coverage@10 [1 table, n=363]": 99.7,
+      "coverage@10 [2 tables, n=935]": 94.7,
+      "coverage@10 [3+ tables, n=236]": 84.7
+    }
+  },
+  "timing_s": {
+    "B2 Dense": 21.8,
+    "B3 Rerank": 770.4
+  }
+}

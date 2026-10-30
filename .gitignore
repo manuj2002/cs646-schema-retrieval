@@ -1,0 +1,6 @@
+dev.zip
+dev_20240627/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
